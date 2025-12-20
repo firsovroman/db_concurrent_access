@@ -1,7 +1,7 @@
 [Connection]
 
 brew install pgcli
-pgcli -h localhost -p 5432 -U postgres isolation_levels # password postgres
+pgcli -h localhost -p 5433 -U postgres isolation_levels # password postgres
 
 [Preparation]
 
