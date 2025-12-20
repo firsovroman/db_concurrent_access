@@ -365,7 +365,7 @@ CREATE TABLE batches (
 INSERT INTO receipts (batch_num, amount) VALUES (1, 100), (2, 100), (3, 100);
 INSERT INTO batches (batch_num) VALUES (4);
 
-Tx1        			Tx2						Tx3
+Tx1        			            Tx2						                Tx3
 
 begin;
 set transaction isolation
@@ -376,7 +376,7 @@ level;
                                 set transaction isolation
                                 level repeatable read;
                                 show transaction isolation level;
-				                                        begin;
+				                                                        begin;
                                                                         set transaction isolation
                                                                         level repeatable read;
                                                                         show transaction isolation level;
@@ -384,9 +384,9 @@ level;
 select batch_num from batches
 order by batch_num desc
 limit 1;
-				insert into batches (batch_num)
-				values (5);
-				commit;
+				                insert into batches (batch_num)
+				                values (5);
+				                commit;
                                                                         – x := 5
                                                                         select batch_num from batches
                                                                         order by batch_num desc
