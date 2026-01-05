@@ -1,0 +1,385 @@
+pgcli -h localhost -p 5433 -U postgres locking_demo
+# password postgres
+
+[Preparation]
+DROP TABLE IF EXISTS accounts;
+CREATE TABLE accounts (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(255) NOT NULL UNIQUE,
+    balance NUMERIC(15, 2) NOT NULL
+);
+INSERT INTO accounts (username, balance) VALUES
+('john_doe', 1500.00),
+('jane_smith', 2500.50),
+('alex_brown', 500.75),
+('emma_white', 3200.00);
+
+-- Вспомогательная функция для просмотра блокировок
+CREATE OR REPLACE FUNCTION show_locks(pid_filter INTEGER DEFAULT NULL)
+RETURNS TABLE (
+    locktype TEXT,
+    relation TEXT,
+    mode TEXT,
+    granted BOOLEAN,
+    transactionid BIGINT,
+    page INTEGER,
+    tuple INTEGER
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        l.locktype::TEXT,
+        CASE
+            WHEN l.relation IS NOT NULL THEN (SELECT relname FROM pg_class WHERE oid = l.relation)
+            ELSE ''
+        END::TEXT,
+        l.mode::TEXT,
+        l.granted,
+        l.transactionid,
+        l.page,
+        l.tuple
+    FROM pg_locks l
+    WHERE (pid_filter IS NULL OR l.pid = pid_filter)
+    AND l.granted = TRUE
+    ORDER BY l.locktype;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ==========================================================
+-- Явные блокировки строк (ROW LEVEL LOCKS)
+-- ==========================================================
+
+-- FOR UPDATE (исключительная блокировка)
+-- ==========================================================
+Tx1                                                         Tx2
+
+begin;
+set transaction isolation level read committed;
+-- Заблокируем строку для обновления
+select * from accounts where id = 1 for update;
+                                                begin;
+                                                set transaction isolation level read committed;
+                                                -- Попробуем заблокировать ту же строку
+                                                select * from accounts where id = 1 for update;
+                                                -- Будет ждать...
+
+-- Проверим блокировки
+select * from show_locks(pg_backend_pid());
+                                                -- Во второй транзакции:
+                                                select * from show_locks(pg_backend_pid());
+
+-- Совершим изменения
+update accounts set balance = balance + 100 where id = 1;
+commit; -- освобождает блокировку
+                                                -- Теперь Tx2 получает блокировку и продолжает
+                                                update accounts set balance = balance - 50 where id = 1;
+                                                commit;
+
+-- FOR SHARE (разделяемая блокировка)
+-- ==========================================================
+Tx1                                                         Tx2
+
+begin;
+set transaction isolation level read committed;
+-- Разделяемая блокировка
+select * from accounts where id = 1 for share;
+                                                begin;
+                                                set transaction isolation level read committed;
+                                                -- Можем тоже получить разделяемую блокировку
+                                                select * from accounts where id = 1 for share;
+                                                -- Но не можем получить FOR UPDATE
+                                                select * from accounts where id = 1 for update;
+                                                -- Будет ждать...
+
+commit; -- освобождает разделяемую блокировку
+                                                -- Теперь можно получить FOR UPDATE
+
+
+
+-- FOR NO KEY UPDATE (блокировка для изменения неключевых полей)
+-- ==========================================================
+Tx1                                                         Tx2
+
+begin;
+-- Эта блокировка позволяет другим транзакциям читать ключевые поля
+select * from accounts where id = 1 for no key update;
+
+                                                begin;
+                                                -- Можем читать с FOR KEY SHARE
+                                                select * from accounts where id = 1 for key share;
+                                                -- Но не можем обновлять ключевые поля
+                                                update accounts set id = 100 where id = 1;
+                                                -- Будет ждать...
+
+commit;
+                                                -- Теперь можем обновлять
+
+-- ==========================================================
+-- Конфликты разных типов блокировок строк
+-- ==========================================================
+
+Tx1                                                         Tx2
+
+begin;
+-- Исключительная блокировка
+select * from accounts where id = 1 for update;
+                                                begin;
+                                                -- Разделяемая блокировка - будет ждать
+                                                select * from accounts where id = 1 for share;
+                                                -- Проверим состояние ожидания
+                                                select wait_event_type, wait_event
+                                                from pg_stat_activity
+                                                where pid = pg_backend_pid();
+
+-- Подождем 5 секунд
+select pg_sleep(5);
+commit; -- освобождаем, Tx2 продолжит
+                                                -- Теперь получит блокировку FOR SHARE
+
+-- ==========================================================
+-- Явные блокировки таблиц (TABLE LEVEL LOCKS)
+-- ==========================================================
+
+-- ACCESS EXCLUSIVE LOCK (самая строгая)
+-- ==========================================================
+Tx1                                                         Tx2
+
+begin;
+-- Блокируем всю таблицу для любых операций
+lock table accounts in access exclusive mode;
+                                                begin;
+                                                -- Любая операция будет ждать
+                                                select * from accounts limit 1;
+                                                -- Проверим ожидание
+                                                select wait_event_type, wait_event
+                                                from pg_stat_activity
+                                                where pid = pg_backend_pid();
+
+-- Можем делать что угодно с таблицей
+alter table accounts add column new_column integer;
+update accounts set balance = 0;
+commit; -- освобождаем блокировку
+                                                -- Теперь SELECT выполнится
+
+-- SHARE LOCK (разделяемая блокировка таблицы)
+-- ==========================================================
+Tx1                                                         Tx2
+
+begin;
+-- Разделяемая блокировка таблицы
+lock table accounts in share mode;
+                                                begin;
+                                                -- Можем тоже получить SHARE блокировку
+                                                lock table accounts in share mode;
+                                                -- Но не можем получить EXCLUSIVE
+                                                lock table accounts in exclusive mode;
+                                                -- Будет ждать...
+
+commit;
+                                                -- Теперь можем получить EXCLUSIVE
+
+-- ROW EXCLUSIVE LOCK (автоматически берется при UPDATE/INSERT/DELETE)
+-- ==========================================================
+Tx1                                                         Tx2
+
+begin;
+-- UPDATE автоматически берет ROW EXCLUSIVE на таблицу
+update accounts set balance = 100 where id = 1;
+                                                begin;
+                                                -- Можем делать другие UPDATE на другие строки
+                                                update accounts set balance = 200 where id = 2;
+                                                -- Но не можем сделать ALTER TABLE
+                                                alter table accounts add column test_column integer;
+                                                -- Будет ждать...
+
+commit;
+                                                -- Теперь ALTER TABLE выполнится
+
+-- ==========================================================
+-- Конфликты блокировок таблиц
+-- ==========================================================
+
+-- Матрица совместимости на практике
+-- ==========================================================
+Tx1                                                         Tx2
+
+begin;
+-- ACCESS SHARE (слабейшая, берется при SELECT)
+select * from accounts where id = 1;
+                                                begin;
+                                                -- Можем получить ACCESS SHARE
+                                                select * from accounts where id = 2;
+                                                -- И даже ROW EXCLUSIVE
+                                                update accounts set balance = 300 where id = 3;
+                                                -- Но не ACCESS EXCLUSIVE
+                                                drop table accounts;
+                                                -- Будет ждать...
+
+commit;
+                                                -- Теперь DROP выполнится (если других блокировок нет)
+
+-- ==========================================================
+-- Deadlock (взаимоблокировка)
+-- ==========================================================
+
+Tx1                                                         Tx2
+
+begin;
+-- Блокируем строку 1
+select * from accounts where id = 1 for update;
+                                                begin;
+                                                -- Блокируем строку 2
+                                                select * from accounts where id = 2 for update;
+                                                -- Пытаемся заблокировать строку 2
+                                                select * from accounts where id = 2 for update;
+                                                -- Ждем...
+                                                -- Пытаемся заблокировать строку 1
+                                                select * from accounts where id = 1 for update;
+                                                -- Deadlock! PostgreSQL обнаружит и откатит одну из транзакций
+                                                -- Обычно выбирает ту, что проще откатить
+
+-- PostgreSQL обнаружит deadlock через deadlock_timeout (по умолчанию 1с)
+-- Одна из транзакций получит ошибку:
+-- ERROR:  deadlock detected
+
+-- ==========================================================
+-- NOWAIT - не ждать блокировку
+-- ==========================================================
+Tx1                                                         Tx2
+
+begin;
+select * from accounts where id = 1 for update;
+                                                begin;
+                                                -- Попробуем получить блокировку без ожидания
+                                                select * from accounts where id = 1 for update nowait;
+                                                -- Сразу получим ошибку:
+                                                -- ERROR:  could not obtain lock on row in relation "accounts"
+
+-- Работаем дальше...
+select pg_sleep(2);
+commit;
+
+-- ==========================================================
+-- SKIP LOCKED - пропускать заблокированные строки
+-- ==========================================================
+Tx1                                                         Tx2
+
+begin;
+-- Блокируем некоторые строки
+select * from accounts where id in (1, 2) for update;
+                                                begin;
+                                                -- Берем первую незаблокированную строку
+                                                select * from accounts
+                                                where id in (1, 2, 3, 4)
+                                                for update skip locked;
+                                                -- Получим только строки 3 и 4
+                                                commit;
+commit;
+
+-- ==========================================================
+-- Мониторинг блокировок
+-- ==========================================================
+
+-- Просмотр всех текущих блокировок
+-- ==========================================================
+Tx1                                                         Tx2
+
+begin;
+select * from accounts where id = 1 for update;
+-- Посмотрим свои блокировки
+select * from show_locks(pg_backend_pid());
+                                                begin;
+                                                -- Попробуем заблокировать ту же строку
+                                                select * from accounts where id = 1 for update;
+                                                -- Посмотрим блокировки с ожиданием
+                                                select
+                                                    a.pid as waiting_pid,
+                                                    a.query as waiting_query,
+                                                    b.pid as blocking_pid,
+                                                    b.query as blocking_query
+                                                from pg_stat_activity a
+                                                join pg_locks l1 on a.pid = l1.pid and not l1.granted
+                                                join pg_locks l2 on l1.relation = l2.relation
+                                                    and l1.locktype = l2.locktype
+                                                    and l2.granted
+                                                join pg_stat_activity b on l2.pid = b.pid
+                                                where a.pid = pg_backend_pid();
+
+-- Функция для поиска блокирующих процессов
+select pg_blocking_pids(pg_backend_pid());
+
+-- ==========================================================
+-- Блокировки и таймауты
+-- ==========================================================
+
+-- Установка таймаута для ожидания блокировки
+-- ==========================================================
+Tx1                                                         Tx2
+
+begin;
+set lock_timeout = '2s'; -- ждать блокировку не более 2 секунд
+select * from accounts where id = 1 for update;
+                                                begin;
+                                                -- Держим блокировку долго
+                                                select * from accounts where id = 1 for update;
+                                                select pg_sleep(5); -- спим 5 секунд
+                                                commit;
+-- Tx1 получит ошибку через 2 секунды:
+-- ERROR:  canceling statement due to lock timeout
+
+-- ==========================================================
+-- Advisory Locks (рекомендательные блокировки)
+-- ==========================================================
+
+-- Использование pg_advisory_lock
+-- ==========================================================
+Tx1                                                         Tx2
+
+begin;
+-- Блокировка по числовому идентификатору
+select pg_advisory_lock(123456);
+-- Проверим в pg_locks
+select * from pg_locks where locktype = 'advisory';
+                                                begin;
+                                                -- Попробуем захватить ту же рекомендательную блокировку
+                                                select pg_advisory_lock(123456);
+                                                -- Будет ждать...
+                                                commit;
+-- Освобождаем
+select pg_advisory_unlock(123456);
+commit;
+                                                -- Теперь Tx2 получит блокировку
+
+-- Advisory lock с NOWAIT
+select pg_advisory_lock(789);
+                                                select pg_try_advisory_lock(789); -- вернет false если не получилось
+
+-- ==========================================================
+-- Практический пример: банковский перевод с блокировками
+-- ==========================================================
+
+-- Безопасный перевод денег
+-- ==========================================================
+Tx1 (перевод с 1 на 2)                                       Tx2 (перевод с 2 на 3)
+
+begin;
+-- Блокируем обе строки в правильном порядке (по ID для избежания deadlock)
+select * from accounts where id in (1, 2) order by id for update;
+-- Проверяем баланс
+select balance from accounts where id = 1;
+-- Если баланс достаточный, выполняем перевод
+update accounts set balance = balance - 100 where id = 1;
+update accounts set balance = balance + 100 where id = 2;
+commit;
+                                                begin;
+                                                -- Тоже блокируем в том же порядке
+                                                select * from accounts where id in (2, 3) order by id for update;
+                                                update accounts set balance = balance - 50 where id = 2;
+                                                update accounts set balance = balance + 50 where id = 3;
+                                                commit;
+
+-- ==========================================================
+-- Очистка
+-- ==========================================================
+-- Вне транзакций
+drop function show_locks;
